@@ -3,18 +3,27 @@
 # See license.txt
 
 import time
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 from rq import exceptions as rq_exc
 from rq.job import Job
 
 import frappe
-from frappe.core.doctype.rq_job.rq_job import RQJob, remove_failed_jobs, stop_job
+from frappe.core.doctype.rq_job.rq_job import (
+	MAX_MATCHED_JOBS,
+	RQJob,
+	get_wait_time_distribution,
+	remove_failed_jobs,
+	stop_job,
+	validate_wait_boundaries,
+	wait_bucket_index,
+)
 from frappe.installer import update_site_config
 from frappe.tests import IntegrationTestCase, timeout
 from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import cstr, execute_in_shell
-from frappe.utils.background_jobs import get_job_status, is_job_enqueued
+from frappe.utils.background_jobs import get_job, get_job_status, is_job_enqueued
 
 
 @timeout(seconds=60)
@@ -155,6 +164,186 @@ class TestRQJob(IntegrationTestCase):
 		)
 		# One id per status from the single matching queue.
 		self.assertEqual(len(result), 7)
+
+	def test_wait_boundaries_validation(self):
+		self.assertEqual(validate_wait_boundaries([0, 10, 60]), [0, 10, 60])
+		self.assertEqual(validate_wait_boundaries("[0, 10]"), [0, 10])
+
+		invalid = [
+			[],
+			"[",
+			10,
+			[-1],
+			[1.5],
+			[True],
+			[1, None],
+			[10, 10],
+			[10, 5],
+			list(range(101)),
+		]
+		for boundaries in invalid:
+			with self.assertRaises(frappe.ValidationError):
+				validate_wait_boundaries(boundaries)
+
+	def test_wait_bucket_index_left_closed_right_open(self):
+		boundaries = [10, 60, 300]
+		self.assertEqual(wait_bucket_index(0, boundaries), 0)
+		self.assertEqual(wait_bucket_index(9.999, boundaries), 0)
+		self.assertEqual(wait_bucket_index(10, boundaries), 1)
+		self.assertEqual(wait_bucket_index(59.999, boundaries), 1)
+		self.assertEqual(wait_bucket_index(60, boundaries), 2)
+		self.assertEqual(wait_bucket_index(299.999, boundaries), 2)
+		self.assertEqual(wait_bucket_index(300, boundaries), 3)
+		self.assertEqual(wait_bucket_index(10**9, boundaries), 3)
+
+		# Single boundary: both ends are overflow buckets.
+		self.assertEqual(wait_bucket_index(4.99, [5]), 0)
+		self.assertEqual(wait_bucket_index(5, [5]), 1)
+
+	def test_get_wait_time_distribution(self):
+		module = "frappe.core.doctype.rq_job.rq_job"
+		site = frappe.local.site
+		now = datetime.now(timezone.utc)
+
+		def aged(seconds):
+			job = MagicMock()
+			job.enqueued_at = now - timedelta(seconds=seconds)
+			return job
+
+		missing = MagicMock()
+		missing.enqueued_at = None
+		future = MagicMock()
+		future.enqueued_at = now + timedelta(minutes=10)
+
+		jobs_by_id = {f"{site}||d{i}": aged(age) for i, age in enumerate([0, 5, 20, 90, 400])}
+		jobs_by_id.update(
+			{
+				f"{site}||l1": aged(15),
+				f"{site}||gone": None,  # id still in list, hash already gone
+				f"{site}||l2": missing,  # no enqueued_at stored
+				f"{site}||l3": future,  # enqueued in the future
+				f"{site}||l4": aged(600),
+			}
+		)
+
+		default_queue = MagicMock()
+		default_queue.name = "test-bench:default"
+		default_queue.get_job_ids.return_value = [f"{site}||d{i}" for i in range(5)] + [
+			f"{site}||d0"  # duplicate listing must count the job once
+		]
+
+		long_queue = MagicMock()
+		long_queue.name = "test-bench:long"
+		long_queue.get_job_ids.return_value = [
+			f"{site}||l1",
+			"other-site.example||foreign",  # another site must never be fetched or counted
+			f"{site}||gone",
+			f"{site}||l2",
+			f"{site}||l3",
+			f"{site}||l4",
+		]
+
+		short_queue = MagicMock()
+		short_queue.name = "test-bench:short"
+		short_queue.get_job_ids.return_value = []
+
+		def fetch_many(job_ids, connection):
+			self.assertNotIn("other-site.example||foreign", job_ids)
+			return [jobs_by_id[job_id] for job_id in job_ids]
+
+		with (
+			patch(f"{module}.get_queues", return_value=[long_queue, short_queue, default_queue]),
+			patch(f"{module}.get_redis_conn", return_value=MagicMock()),
+			patch(f"{module}.Job.fetch_many", side_effect=fetch_many),
+		):
+			result = get_wait_time_distribution([10, 60, 300])
+
+		self.assertEqual([q.queue for q in result.queues], ["default", "long", "short"])
+		self.assertEqual(
+			result.ranges,
+			[
+				{"lower": None, "upper": 10},
+				{"lower": 10, "upper": 60},
+				{"lower": 60, "upper": 300},
+				{"lower": 300, "upper": None},
+			],
+		)
+
+		default, long, short = result.queues
+		self.assertEqual(default.buckets, [2, 1, 1, 1])
+		self.assertEqual(default.observed, 5)
+		self.assertEqual(long.buckets, [0, 1, 0, 1])
+		self.assertEqual(long.missing_enqueued_at, 1)
+		self.assertEqual(long.future_enqueued_at, 1)
+		self.assertEqual(long.disappeared, 1)
+		self.assertEqual(long.observed, 5)
+		self.assertEqual(short.buckets, [0, 0, 0, 0])
+		self.assertEqual(short.observed, 0)
+
+		self.assertEqual(result.totals.buckets, [2, 2, 1, 2])
+		self.assertEqual(result.totals.missing_enqueued_at, 1)
+		self.assertEqual(result.totals.future_enqueued_at, 1)
+		self.assertEqual(result.totals.disappeared, 1)
+		self.assertEqual(result.totals.observed, 10)
+
+		sampled_at = datetime.fromisoformat(result.sampled_at)
+		self.assertEqual(sampled_at.utcoffset(), timedelta(0))
+		self.assertIs(result.is_atomic_snapshot, False)
+		self.assertTrue(result.note)
+
+		# Only aggregate stats are exposed: never job ids, arguments or traces.
+		for queue in result.queues:
+			self.assertTrue({"queue", "buckets", "observed"} <= set(queue.keys()))
+			self.assertNotIn("job_id", queue)
+
+	def test_get_wait_time_distribution_is_not_truncated_by_list_limit(self):
+		module = "frappe.core.doctype.rq_job.rq_job"
+		site = frappe.local.site
+		count = MAX_MATCHED_JOBS + 100
+		now = datetime.now(timezone.utc)
+
+		queue = MagicMock()
+		queue.name = "test-bench:default"
+		queue.get_job_ids.return_value = [f"{site}||j{i}" for i in range(count)]
+
+		def fetch_many(job_ids, connection):
+			return [MagicMock(enqueued_at=now - timedelta(seconds=1)) for _ in job_ids]
+
+		with (
+			patch(f"{module}.get_queues", return_value=[queue]),
+			patch(f"{module}.get_redis_conn", return_value=MagicMock()),
+			patch(f"{module}.Job.fetch_many", side_effect=fetch_many),
+		):
+			result = get_wait_time_distribution([10, 60])
+
+		self.assertEqual(result.totals.buckets, [count, 0, 0])
+		self.assertEqual(result.totals.observed, count)
+
+	def test_get_wait_time_distribution_requires_permission(self):
+		with self.set_user("test@example.com"):
+			with self.assertRaises(frappe.PermissionError):
+				get_wait_time_distribution([10, 60])
+
+	def test_get_wait_time_distribution_live(self):
+		job_ids = []
+		try:
+			for _ in range(2):
+				job = frappe.enqueue(method=self.BG_JOB, queue="long")
+				job_ids.append(job.id)
+
+			result = get_wait_time_distribution([10, 60, 300])
+			queue_names = [q.queue for q in result.queues]
+			self.assertEqual(queue_names, sorted(queue_names))
+			self.assertIn("long", queue_names)
+
+			long_stats = next(q for q in result.queues if q.queue == "long")
+			self.assertEqual(sum(long_stats.buckets), long_stats.observed)
+			self.assertGreaterEqual(long_stats.observed, 2)
+		finally:
+			for job_id in job_ids:
+				job = get_job(job_id)
+				if job and job.get_status(refresh=False) == "queued":
+					job.cancel()
 
 	@requires_test_service(TestService.BACKGROUND_WORKER)
 	@timeout

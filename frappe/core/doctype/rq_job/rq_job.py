@@ -3,6 +3,8 @@
 
 import functools
 import re
+from bisect import bisect_right
+from datetime import datetime, timezone
 
 from rq.command import send_stop_job_command
 from rq.exceptions import InvalidJobOperation, NoSuchJobError
@@ -24,6 +26,7 @@ from frappe.utils.background_jobs import get_queue_args, get_queues, get_redis_c
 QUEUES = ["default", "long", "short"]
 JOB_STATUSES = ["queued", "started", "failed", "finished", "deferred", "scheduled", "canceled"]
 MAX_MATCHED_JOBS = 5000
+MAX_WAIT_BOUNDARIES = 100
 
 
 def check_permissions(method):
@@ -309,3 +312,115 @@ def stop_job(job_id: str):
 def get_custom_queues():
 	frappe.has_permission("RQ Job", throw=True)
 	return list((frappe.conf.workers or {}).keys())
+
+
+@frappe.whitelist()
+def get_wait_time_distribution(boundaries):
+	"""Histogram of current-site queued jobs over seconds spent waiting.
+
+	Read-only: jobs are never cancelled or executed, and only counts are
+	returned. ``boundaries`` are strictly increasing non-negative seconds; the
+	buckets are left-closed/right-open with overflow buckets on both ends.
+	Queue reads are sequential Redis commands, not an atomic snapshot across
+	queues, so jobs may move or vanish mid-scan; the latter are reported as
+	``disappeared``.
+	"""
+	frappe.has_permission("RQ Job", throw=True)
+	boundaries = validate_wait_boundaries(boundaries)
+
+	sampled_at = datetime.now(timezone.utc)
+	site_prefix = f"{frappe.local.site}||"
+	conn = get_redis_conn()
+
+	queue_stats = []
+	for queue in get_queues(connection=conn):
+		job_ids = list(dict.fromkeys(queue.get_job_ids()))
+		job_ids = [job_id for job_id in job_ids if job_id.startswith(site_prefix)]
+
+		buckets = [0] * (len(boundaries) + 1)
+		missing_enqueued_at = 0
+		future_enqueued_at = 0
+		disappeared = 0
+
+		for job in Job.fetch_many(job_ids=job_ids, connection=conn):
+			if job is None:
+				disappeared += 1
+			elif job.enqueued_at is None:
+				missing_enqueued_at += 1
+			elif job.enqueued_at > sampled_at:
+				future_enqueued_at += 1
+			else:
+				wait_seconds = (sampled_at - job.enqueued_at).total_seconds()
+				buckets[wait_bucket_index(wait_seconds, boundaries)] += 1
+
+		queue_stats.append(
+			frappe._dict(
+				queue=queue.name.rsplit(":", 1)[-1],
+				buckets=buckets,
+				missing_enqueued_at=missing_enqueued_at,
+				future_enqueued_at=future_enqueued_at,
+				disappeared=disappeared,
+				observed=sum(buckets) + missing_enqueued_at + future_enqueued_at + disappeared,
+			)
+		)
+
+	queue_stats.sort(key=lambda q: q.queue)
+
+	ranges = [{"lower": None, "upper": boundaries[0]}]
+	ranges += [{"lower": lo, "upper": hi} for lo, hi in zip(boundaries, boundaries[1:])]
+	ranges.append({"lower": boundaries[-1], "upper": None})
+
+	return frappe._dict(
+		sampled_at=sampled_at.isoformat(),
+		boundaries=boundaries,
+		ranges=ranges,
+		queues=queue_stats,
+		totals=frappe._dict(
+			buckets=[sum(q.buckets[i] for q in queue_stats) for i in range(len(ranges))],
+			missing_enqueued_at=sum(q.missing_enqueued_at for q in queue_stats),
+			future_enqueued_at=sum(q.future_enqueued_at for q in queue_stats),
+			disappeared=sum(q.disappeared for q in queue_stats),
+			observed=sum(q.observed for q in queue_stats),
+		),
+		is_atomic_snapshot=False,
+		note=_(
+			"Queues can change while Redis is being read; these counts are not"
+			" an atomic snapshot across queues."
+		),
+	)
+
+
+def validate_wait_boundaries(boundaries) -> list[int]:
+	if isinstance(boundaries, str):
+		try:
+			boundaries = frappe.parse_json(boundaries)
+		except ValueError:
+			boundaries = None
+
+	error = None
+	if not isinstance(boundaries, list) or not boundaries:
+		error = _("Wait time boundaries must be a non-empty list.")
+	elif len(boundaries) > MAX_WAIT_BOUNDARIES:
+		error = _("At most {0} wait time boundaries are allowed.").format(MAX_WAIT_BOUNDARIES)
+	else:
+		validated = []
+		previous = -1
+		for value in boundaries:
+			if isinstance(value, bool) or not isinstance(value, int):
+				error = _("Wait time boundaries must be non-negative integers.")
+				break
+			if value < 0 or value <= previous:
+				error = _("Wait time boundaries must be strictly increasing non-negative integers.")
+				break
+			validated.append(value)
+			previous = value
+		boundaries = validated
+
+	if error:
+		frappe.throw(error, title=_("Invalid Wait Time Boundaries"))
+
+	return boundaries
+
+
+def wait_bucket_index(wait_seconds: float, boundaries: list[int]) -> int:
+	return bisect_right(boundaries, wait_seconds)
