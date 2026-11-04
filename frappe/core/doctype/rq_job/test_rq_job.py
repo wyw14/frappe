@@ -4,17 +4,18 @@
 
 import time
 from unittest.mock import patch
+from uuid import uuid4
 
 from rq import exceptions as rq_exc
 from rq.job import Job
 
 import frappe
-from frappe.core.doctype.rq_job.rq_job import RQJob, remove_failed_jobs, stop_job
+from frappe.core.doctype.rq_job.rq_job import RQJob, bulk_cancel_jobs, remove_failed_jobs, stop_job
 from frappe.installer import update_site_config
 from frappe.tests import IntegrationTestCase, timeout
 from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import cstr, execute_in_shell
-from frappe.utils.background_jobs import get_job_status, is_job_enqueued
+from frappe.utils.background_jobs import get_job_status, get_queue, get_redis_conn, is_job_enqueued
 
 
 @timeout(seconds=60)
@@ -270,6 +271,126 @@ class TestRQJob(IntegrationTestCase):
 	def test_pickle_lazy_doc_for_rq_job(self):
 		job = frappe.enqueue(test_serialization, user=frappe.get_lazy_doc("User", "Guest"))
 		self.check_status(job, "finished")
+
+	def test_bulk_cancel_queued_jobs(self):
+		job1 = frappe.enqueue(self.BG_JOB, queue="short")
+		job2 = frappe.enqueue(self.BG_JOB, queue="short")
+
+		results = bulk_cancel_jobs([job1.id, job2.id])
+
+		self.assertEqual(
+			results,
+			[
+				{"job_id": job1.id, "status": "canceled"},
+				{"job_id": job2.id, "status": "canceled"},
+			],
+		)
+		queue = get_queue("short")
+		for job in (job1, job2):
+			self.assertEqual(Job.fetch(job.id, connection=get_redis_conn()).get_status(), "canceled")
+			self.assertNotIn(job.id, queue.get_job_ids())
+			self.assertIn(job.id, queue.canceled_job_registry.get_job_ids(cleanup=False))
+
+		# An already canceled job is reported as ended, not canceled again.
+		self.assertEqual(bulk_cancel_jobs([job1.id])[0]["status"], "finished")
+
+	def test_bulk_cancel_deduplicates_ids(self):
+		job = frappe.enqueue(self.BG_JOB, queue="short")
+		missing_id = f"{frappe.local.site}||missing-{uuid4()}"
+
+		results = bulk_cancel_jobs([job.id, job.id, missing_id, missing_id])
+
+		self.assertEqual(
+			[result["status"] for result in results],
+			["canceled", "duplicate", "not_found", "duplicate"],
+		)
+
+	def test_bulk_cancel_races_worker_taking_queued_job(self):
+		conn = get_redis_conn()
+		queue = get_queue("short")
+
+		# A single-queue worker atomically moves the id to its intermediate queue
+		# with BLMOVE before flipping the status to started.
+		taken_job = frappe.enqueue(self.BG_JOB, queue="short")
+		self.assertEqual(conn.lrem(queue.key, 1, taken_job.id), 1)
+		conn.rpush(queue.intermediate_queue_key, taken_job.id)
+		try:
+			results = bulk_cancel_jobs([taken_job.id, taken_job.id])
+			self.assertEqual([result["status"] for result in results], ["started", "duplicate"])
+			# The job is neither modified nor moved to the canceled registry.
+			self.assertEqual(Job.fetch(taken_job.id, connection=conn).get_status(), "queued")
+			self.assertIn(taken_job.id.encode(), conn.lrange(queue.intermediate_queue_key, 0, -1))
+			self.assertNotIn(taken_job.id, queue.canceled_job_registry.get_job_ids(cleanup=False))
+		finally:
+			conn.lrem(queue.intermediate_queue_key, 1, taken_job.id)
+			taken_job.delete()
+
+		# Worker already popped the id and flipped the status to started.
+		started_job = frappe.enqueue(self.BG_JOB, queue="short")
+		queue.remove(started_job)
+		started_job.set_status("started")
+		try:
+			results = bulk_cancel_jobs([started_job.id])
+			self.assertEqual(results[0]["status"], "started")
+			self.assertEqual(Job.fetch(started_job.id, connection=conn).get_status(), "started")
+			self.assertNotIn(started_job.id, queue.canceled_job_registry.get_job_ids(cleanup=False))
+		finally:
+			started_job.delete(remove_from_queue=False)
+
+	def test_bulk_cancel_never_reads_or_touches_other_sites(self):
+		conn = get_redis_conn()
+		queue = get_queue("short")
+		foreign_id = f"other.{frappe.local.site}.example||{uuid4()}"
+		foreign_job = Job.create(func=self.BG_JOB, id=foreign_id, connection=conn)
+		queue.enqueue_job(foreign_job)
+		local_job = frappe.enqueue(self.BG_JOB, queue="short")
+		try:
+			results = bulk_cancel_jobs([foreign_id, local_job.id])
+			self.assertEqual([result["status"] for result in results], ["not_found", "canceled"])
+			# The foreign job is untouched and still queued on its site.
+			self.assertEqual(Job.fetch(foreign_id, connection=conn).get_status(), "queued")
+			self.assertIn(foreign_id, queue.get_job_ids())
+		finally:
+			foreign_job.delete()
+
+	def test_bulk_cancel_partial_failure_keeps_going(self):
+		cancelable1 = frappe.enqueue(self.BG_JOB, queue="short")
+		missing_id = f"{frappe.local.site}||missing-{uuid4()}"
+		foreign_id = f"other.{frappe.local.site}.example||{uuid4()}"
+		cancelable2 = frappe.enqueue(self.BG_JOB, queue="short")
+
+		results = bulk_cancel_jobs([cancelable1.id, missing_id, foreign_id, cancelable2.id, missing_id])
+
+		self.assertEqual(
+			[(result["job_id"], result["status"]) for result in results],
+			[
+				(cancelable1.id, "canceled"),
+				(missing_id, "not_found"),
+				(foreign_id, "not_found"),
+				(cancelable2.id, "canceled"),
+				(missing_id, "duplicate"),
+			],
+		)
+		# Successful cancellations are not rolled back.
+		for job in (cancelable1, cancelable2):
+			self.assertEqual(Job.fetch(job.id, connection=get_redis_conn()).get_status(), "canceled")
+
+	def test_bulk_cancel_validates_input(self):
+		self.assertRaises(frappe.ValidationError, bulk_cancel_jobs, 5)
+		self.assertRaises(frappe.ValidationError, bulk_cancel_jobs, [1])
+		self.assertRaises(frappe.ValidationError, bulk_cancel_jobs, [""])
+		self.assertEqual(bulk_cancel_jobs([]), [])
+
+	def test_bulk_cancel_requires_system_manager(self):
+		job = frappe.enqueue(self.BG_JOB, queue="short")
+
+		frappe.set_user("Guest")
+		try:
+			self.assertRaises(frappe.PermissionError, bulk_cancel_jobs, [job.id])
+		finally:
+			frappe.set_user("Administrator")
+
+		self.assertEqual(Job.fetch(job.id, connection=get_redis_conn()).get_status(), "queued")
 
 
 def test_serialization(user):

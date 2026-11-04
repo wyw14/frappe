@@ -6,7 +6,7 @@ import re
 
 from rq.command import send_stop_job_command
 from rq.exceptions import InvalidJobOperation, NoSuchJobError
-from rq.job import Job
+from rq.job import Job, JobStatus
 from rq.queue import Queue
 
 import frappe
@@ -303,6 +303,75 @@ def get_all_queued_jobs():
 @frappe.whitelist()
 def stop_job(job_id: str):
 	frappe.get_doc("RQ Job", job_id).stop_job()
+
+
+@frappe.whitelist(methods=["POST"])
+def bulk_cancel_jobs(job_ids: str | list) -> list[dict]:
+	"""Cancel queued jobs of the current site before a worker starts them.
+
+	Returns one ``{"job_id", "status"}`` entry per input id, in input order.
+	``status`` is one of:
+
+	- ``canceled``: the job was still queued and was removed from the queue, so it will not run;
+	- ``started``: a worker had already taken the job, it was neither interrupted nor modified;
+	- ``finished``: the job was finished, failed, stopped, canceled, deferred or scheduled;
+	- ``not_found``: no current-site job with that id, including ids of other sites;
+	- ``duplicate``: the id repeats an earlier entry and was not attempted again.
+
+	One item failing does not stop the others, and already canceled items are not rolled back.
+	"""
+	frappe.only_for("System Manager")
+	job_ids = frappe.parse_json(job_ids)
+	if not isinstance(job_ids, list) or any(not isinstance(job_id, str) or not job_id for job_id in job_ids):
+		frappe.throw(_("job_ids must be a list of job ID strings"))
+
+	connection = get_redis_conn()
+	seen = set()
+	results = []
+	for job_id in job_ids:
+		if job_id in seen:
+			results.append({"job_id": job_id, "status": "duplicate"})
+			continue
+		seen.add(job_id)
+		results.append({"job_id": job_id, "status": _cancel_queued_job(job_id, connection)})
+
+	return results
+
+
+def _cancel_queued_job(job_id: str, connection) -> str:
+	if not job_id.startswith(f"{frappe.local.site}||"):
+		return "not_found"
+
+	try:
+		job = Job.fetch(job_id, connection=connection)
+		status = job.get_status()
+	except (NoSuchJobError, InvalidJobOperation):
+		return "not_found"
+
+	if status == JobStatus.STARTED:
+		return "started"
+	if status != JobStatus.QUEUED:
+		return "finished"
+
+	# Workers dequeue with BLMOVE/BLPOP, which, like LREM, atomically removes the
+	# id from the queue list. Exactly one side wins. On loss, re-check the status:
+	# "queued"/"started" means a worker owns it, anything else settled meanwhile.
+	if Queue(name=job.origin, connection=connection).remove(job.id) == 0:
+		try:
+			status = job.get_status()
+		except InvalidJobOperation:
+			return "not_found"
+		if status in (JobStatus.QUEUED, JobStatus.STARTED):
+			return "started"
+		return "finished"
+
+	try:
+		job.cancel()
+	except InvalidJobOperation:
+		# A concurrent request removed the id and finished the cancellation first.
+		pass
+
+	return "canceled"
 
 
 @frappe.whitelist()
