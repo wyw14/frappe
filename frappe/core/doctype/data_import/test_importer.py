@@ -27,6 +27,7 @@ from frappe.utils.number_format import NumberFormat
 
 doctype_name = "DocType for Import"
 SAMPLE_IMPORT_DOC_NAMES = ("Test", "Test 2", "Test 3")
+FAILURE_BUDGET_TITLES = ("Good 1", "Good 2", "Good 3", "Fixed Row")
 
 
 def _delete_data_import(data_import_name):
@@ -116,6 +117,7 @@ class TestImporter(IntegrationTestCase):
 	@classmethod
 	def setUpClass(cls):
 		super().setUpClass()
+		frappe.reload_doc("core", "doctype", "data_import")
 		create_doctype_if_not_exists(
 			doctype_name,
 		)
@@ -467,6 +469,199 @@ class TestImporter(IntegrationTestCase):
 		)
 		self.assertEqual(len(import_logs), 3)
 		self.assertFalse(any(not log.success for log in import_logs))
+
+	def _make_failure_budget_import(self, csv_content, file_name, failure_budget):
+		for name in FAILURE_BUDGET_TITLES:
+			frappe.delete_doc_if_exists(doctype_name, name, force=1)
+		frappe.db.commit()  # nosemgrep
+		self.addCleanup(_delete_doctype_records, doctype_name, FAILURE_BUDGET_TITLES)
+
+		import_file = frappe.get_doc(
+			doctype="File",
+			content=csv_content,
+			file_name=file_name,
+			is_private=1,
+		)
+		import_file.save(ignore_permissions=True)
+		self.addCleanup(_delete_file, import_file.name)
+
+		return self.get_importer(doctype_name, import_file, failure_budget=failure_budget)
+
+	def test_failure_budget_pauses_after_document_failures(self):
+		data_import = self._make_failure_budget_import(
+			"Title,Description\nGood 1,hello\n,missing title\nGood 2,world\nGood 3,foo\n",
+			"failure_budget_pause.csv",
+			1,
+		)
+
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+
+		self.assertEqual(data_import.status, "Paused")
+		self.assertTrue(data_import.pause_reason)
+		self.assertTrue(data_import.pause_fingerprint)
+
+		logs = frappe.get_all(
+			"Data Import Log",
+			fields=["success", "row_indexes"],
+			filters={"data_import": data_import.name},
+			order_by="log_index",
+		)
+		self.assertEqual([1, 0], [cint(log.success) for log in logs])
+		self.assertEqual(frappe.parse_json(logs[1].row_indexes), [3])
+
+		# Successful document saved; remaining documents were never attempted.
+		self.assertTrue(frappe.db.exists(doctype_name, "Good 1"))
+		self.assertFalse(frappe.db.exists(doctype_name, "Good 2"))
+		self.assertFalse(frappe.db.exists(doctype_name, "Good 3"))
+
+		from frappe.core.doctype.data_import.data_import import get_import_status
+
+		status = get_import_status(data_import.name)
+		self.assertEqual(status["status"], "Paused")
+		self.assertTrue(status["pause_reason"])
+
+	def test_failure_budget_counts_documents_not_child_rows(self):
+		for name in ("Test 4", "Test 5"):
+			frappe.delete_doc_if_exists(doctype_name, name, force=1)
+		frappe.db.commit()  # nosemgrep
+		self.addCleanup(_delete_doctype_records, doctype_name, ("Test 4", "Test 5"))
+
+		# "Test 5" spans sheet rows 2-3 (two child rows) and fails on missing child titles.
+		import_file = get_import_file("sample_import_file_without_mandatory")
+		data_import = self.get_importer(doctype_name, import_file, failure_budget=1)
+		frappe.clear_messages()
+
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+
+		self.assertEqual(data_import.status, "Paused")
+		failure_logs = frappe.get_all(
+			"Data Import Log",
+			fields=["row_indexes"],
+			filters={"data_import": data_import.name, "success": 0},
+		)
+		self.assertEqual(len(failure_logs), 1)
+		self.assertEqual(frappe.parse_json(failure_logs[0].row_indexes), [2, 3])
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name}), 1
+		)
+		self.assertFalse(frappe.db.exists(doctype_name, "Test 4"))
+
+	def test_failure_budget_without_remaining_documents_does_not_pause(self):
+		data_import = self._make_failure_budget_import(
+			"Title,Description\nGood 1,hello\n,missing title\n",
+			"failure_budget_last_row.csv",
+			1,
+		)
+
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+
+		self.assertEqual(data_import.status, "Partial Success")
+		self.assertFalse(data_import.pause_reason)
+
+	def test_without_failure_budget_all_documents_are_attempted(self):
+		data_import = self._make_failure_budget_import(
+			"Title,Description\nGood 1,hello\n,missing title\nGood 2,world\nGood 3,foo\n",
+			"failure_budget_disabled.csv",
+			0,
+		)
+
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+
+		self.assertEqual(data_import.status, "Partial Success")
+		self.assertFalse(data_import.pause_reason)
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name, "success": 0}),
+			1,
+		)
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name, "success": 1}),
+			3,
+		)
+		for title in ("Good 1", "Good 2", "Good 3"):
+			self.assertTrue(frappe.db.exists(doctype_name, title))
+
+	def test_paused_import_resumes_remaining_when_budget_raised(self):
+		data_import = self._make_failure_budget_import(
+			"Title,Description\nGood 1,hello\n,missing title\nGood 2,world\nGood 3,foo\n",
+			"failure_budget_resume.csv",
+			1,
+		)
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+		self.assertEqual(data_import.status, "Paused")
+
+		frappe.clear_messages()
+		data_import.failure_budget = 10
+		data_import.save()
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+
+		self.assertEqual(data_import.status, "Partial Success")
+		self.assertFalse(data_import.pause_reason)
+		self.assertFalse(data_import.pause_fingerprint)
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name, "success": 0}),
+			1,
+		)
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name, "success": 1}),
+			3,
+		)
+		for title in ("Good 1", "Good 2", "Good 3"):
+			self.assertTrue(frappe.db.exists(doctype_name, title))
+		self.assertEqual(frappe.db.count(doctype_name, {"title": "Good 1"}), 1)
+
+	def test_paused_import_retries_failed_document_after_data_fixed(self):
+		data_import = self._make_failure_budget_import(
+			"Title,Description\nGood 1,hello\n,missing title\nGood 2,world\nGood 3,foo\n",
+			"failure_budget_before_fix.csv",
+			1,
+		)
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+		self.assertEqual(data_import.status, "Paused")
+
+		fixed_file = frappe.get_doc(
+			doctype="File",
+			content="Title,Description\nGood 1,hello\nFixed Row,fixed\nGood 2,world\nGood 3,foo\n",
+			file_name="failure_budget_after_fix.csv",
+			is_private=1,
+		)
+		fixed_file.save(ignore_permissions=True)
+		self.addCleanup(_delete_file, fixed_file.name)
+
+		frappe.clear_messages()
+		data_import.import_file = fixed_file.file_url
+		data_import.save()
+		i = Importer(data_import.reference_doctype, data_import=data_import)
+		i.import_data()
+		data_import.reload()
+
+		self.assertEqual(data_import.status, "Success")
+		self.assertFalse(data_import.pause_reason)
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name, "success": 0}),
+			0,
+		)
+		self.assertEqual(
+			frappe.db.count("Data Import Log", {"data_import": data_import.name, "success": 1}),
+			4,
+		)
+		self.assertEqual(frappe.db.count(doctype_name, {"title": "Good 1"}), 1)
+		self.assertTrue(frappe.db.exists(doctype_name, "Fixed Row"))
+		self.assertTrue(frappe.db.exists(doctype_name, "Good 2"))
+		self.assertTrue(frappe.db.exists(doctype_name, "Good 3"))
 
 	def test_get_import_status_upsert_counts(self):
 		existing_doc = frappe.get_doc(
@@ -1006,7 +1201,15 @@ class TestImporter(IntegrationTestCase):
 				self.assertIsNone(get_df_for_column_header(doctype_name, "Description"))
 				self.assertEqual(get_df_for_column_header(doctype_name, "Title").fieldname, "title")
 
-	def get_importer(self, doctype, import_file, update=False, use_sniffer=False, import_type=None):
+	def get_importer(
+		self,
+		doctype,
+		import_file,
+		update=False,
+		use_sniffer=False,
+		import_type=None,
+		failure_budget=None,
+	):
 		data_import = frappe.new_doc("Data Import")
 		if import_type:
 			data_import.import_type = import_type
@@ -1015,6 +1218,8 @@ class TestImporter(IntegrationTestCase):
 		data_import.reference_doctype = doctype
 		data_import.import_file = import_file.file_url
 		data_import.use_csv_sniffer = use_sniffer
+		if failure_budget is not None:
+			data_import.failure_budget = failure_budget
 		data_import.insert()
 		frappe.db.commit()  # Commit so that the first import failure does not rollback the Data Import insert.  # nosemgrep
 		_register_data_import_cleanup(self, data_import)

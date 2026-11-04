@@ -13,6 +13,8 @@
   "download_template",
   "import_file",
   "payload_count",
+  "pause_reason",
+  "pause_fingerprint",
   "google_sheets_url",
   "refresh_google_sheet",
   "column_break_5",
@@ -22,6 +24,7 @@
   "status",
   "submit_after_import",
   "mute_emails",
+  "failure_budget",
   "template_options",
   "tree_parent_overrides",
   "import_warnings_section",
@@ -158,7 +161,31 @@
    "hidden": 1,
    "label": "Status",
    "no_copy": 1,
-   "options": "Pending\nIn Progress\nSuccess\nPartial Success\nError\nTimed Out",
+   "options": "Pending\nIn Progress\nSuccess\nPartial Success\nError\nTimed Out\nPaused",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Automatically pause after this many documents fail. A document is counted once, even if it spans several child table rows. Set to 0 to keep processing all documents regardless of failures.",
+   "fieldname": "failure_budget",
+   "fieldtype": "Int",
+   "label": "Failure Budget",
+   "read_only_depends_on": "eval: ['Success', 'Partial Success'].includes(doc.status)"
+  },
+  {
+   "fieldname": "pause_reason",
+   "fieldtype": "Small Text",
+   "hidden": 1,
+   "label": "Pause Reason",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "pause_fingerprint",
+   "fieldtype": "Small Text",
+   "hidden": 1,
+   "label": "Pause Fingerprint",
+   "no_copy": 1,
    "read_only": 1
   },
   {
@@ -250,7 +277,7 @@
  "hide_toolbar": 1,
  "icon": "import",
  "links": [],
- "modified": "2026-07-24 14:36:39.136121",
+ "modified": "2026-11-04 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "Data Import",

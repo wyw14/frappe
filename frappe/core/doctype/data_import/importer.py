@@ -220,7 +220,11 @@ class Importer:
 		log_index = 0
 
 		# Do not remove rows in case of retry after an error or pending data import
-		if (
+		if previous_status == "Paused" and self._resume_inputs_changed():
+			# The file or mappings were fixed, so stale failures are retried.
+			import_log = [log for log in import_log if log.get("success")]
+			frappe.db.delete("Data Import Log", {"success": 0, "data_import": self.data_import.name})
+		elif (
 			previous_status in ("Partial Success", "Error", "Timed Out")
 			and len(import_log) >= self.data_import.payload_count
 		):
@@ -258,8 +262,16 @@ class Importer:
 		skipped_rows = get_skipped_row_numbers(self.data_import)
 		skipped_payload_count = 0
 		batch_size = frappe.conf.data_import_batch_size or 1000
+		failure_budget = (
+			cint(self.data_import.get("failure_budget") or 0)
+			if self.data_import.name and self.data_import.meta.has_field("failure_budget")
+			else 0
+		)
+		paused_on_budget = False
 
 		for batch_index, batched_payloads in enumerate(frappe.utils.create_batch(payloads, batch_size)):
+			if paused_on_budget:
+				break
 			for i, payload in enumerate(batched_payloads):
 				doc = payload.doc
 				row_indexes = [row.row_number for row in payload.rows]
@@ -384,6 +396,16 @@ class Importer:
 						activity=self._build_error_activity(messages, row_indexes),
 					)
 
+					if (
+						failure_budget
+						and failed_count >= failure_budget
+						and self._has_unprocessed_importable_payloads(
+							payloads, current_index, skipped_rows
+						)
+					):
+						paused_on_budget = True
+						break
+
 		# Logs are db inserted directly so will have to be fetched again
 		import_log = (
 			frappe.get_all(
@@ -395,34 +417,55 @@ class Importer:
 			or []
 		)
 
-		# set status
-		successes = []
-		failures = []
-		for log in import_log:
-			if log.get("success"):
-				successes.append(log)
-			else:
-				failures.append(log)
-		attempted_payload_count = total_payload_count - skipped_payload_count
-		if attempted_payload_count == 0 or len(successes) == attempted_payload_count:
-			status = "Success"
-		elif len(failures) >= attempted_payload_count and len(successes) == 0:
-			status = "Error"
-		elif len(failures) > 0 and len(successes) > 0:
-			status = "Partial Success"
-			try:
-				frappe.logger("data_import").warning(
-					f"Data Import {self.data_import.name}: {len(failures)} of {attempted_payload_count} rows failed"
-				)
-			except Exception:
-				pass
+		pause_reason = None
+		if paused_on_budget:
+			# The triggering failure log was written before the break; persist it and the successes.
+			frappe.db.commit()
+			status = "Paused"
+			pause_reason = _(
+				"Import paused after {0} document(s) failed: the failure budget of {1} was reached. "
+				"Successfully imported documents and error logs were saved, and the remaining "
+				"documents were not attempted. Increase the failure budget or fix the failed "
+				"document(s), then continue."
+			).format(failed_count, failure_budget)
 		else:
-			status = "Pending"
+			# set status
+			successes = []
+			failures = []
+			for log in import_log:
+				if log.get("success"):
+					successes.append(log)
+				else:
+					failures.append(log)
+			attempted_payload_count = total_payload_count - skipped_payload_count
+			if attempted_payload_count == 0 or len(successes) == attempted_payload_count:
+				status = "Success"
+			elif len(failures) >= attempted_payload_count and len(successes) == 0:
+				status = "Error"
+			elif len(failures) > 0 and len(successes) > 0:
+				status = "Partial Success"
+				try:
+					frappe.logger("data_import").warning(
+						f"Data Import {self.data_import.name}: {len(failures)} of {attempted_payload_count} rows failed"
+					)
+				except Exception:
+					pass
+			else:
+				status = "Pending"
 
 		if self.console:
 			self.print_import_log(import_log)
+		elif paused_on_budget:
+			self._save_paused_state(pause_reason)
 		else:
 			self.data_import.db_set("status", status)
+			if self.data_import.get("pause_reason"):
+				frappe.db.set_value(
+					"Data Import",
+					self.data_import.name,
+					{"pause_reason": "", "pause_fingerprint": ""},
+					update_modified=False,
+				)
 
 		self.after_import()
 
@@ -432,6 +475,34 @@ class Importer:
 		frappe.flags.in_import = False
 		frappe.flags.mute_emails = False
 		clear_cache_after_maintenance()
+
+	def _resume_inputs_changed(self) -> bool:
+		from frappe.core.doctype.data_import.data_import import _import_resume_fingerprint
+
+		return _import_resume_fingerprint(self.data_import) != cstr(
+			self.data_import.get("pause_fingerprint") or ""
+		)
+
+	def _has_unprocessed_importable_payloads(self, payloads, processed_count, skipped_rows) -> bool:
+		"""Whether a non-skipped document still follows the processed ones."""
+		for payload in payloads[processed_count:]:
+			if not {row.row_number for row in payload.rows}.intersection(skipped_rows):
+				return True
+		return False
+
+	def _save_paused_state(self, pause_reason: str):
+		from frappe.core.doctype.data_import.data_import import _import_resume_fingerprint
+
+		frappe.db.set_value(
+			"Data Import",
+			self.data_import.name,
+			{
+				"status": "Paused",
+				"pause_reason": pause_reason,
+				"pause_fingerprint": _import_resume_fingerprint(self.data_import),
+			},
+			update_modified=False,
+		)
 
 	def _publish_progress_event(
 		self,

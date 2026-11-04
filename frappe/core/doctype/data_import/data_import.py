@@ -50,6 +50,15 @@ def _import_source_fingerprint(doc) -> str:
 	)
 
 
+def _import_resume_fingerprint(doc) -> str:
+	"""Inputs that decide whether a paused run's failed documents were fixed.
+
+	When unchanged, the failure logs are kept (user only raised the budget); when changed,
+	the failed documents are retried on resume.
+	"""
+	return _import_source_fingerprint(doc) + "||" + repr(_value_mapping_state(doc))
+
+
 class DataImport(Document):
 	_DOCTYPE_NAME = "Data Import"
 
@@ -67,14 +76,19 @@ class DataImport(Document):
 
 		custom_delimiters: DF.Check
 		delimiter_options: DF.Data | None
+		failure_budget: DF.Int
 		google_sheets_url: DF.Data | None
 		import_file: DF.Attach | None
 		import_type: DF.Literal["Insert New Records", "Update Existing Records", "Insert or Update Records"]
 		mute_emails: DF.Check
+		pause_fingerprint: DF.SmallText | None
+		pause_reason: DF.SmallText | None
 		payload_count: DF.Int
 		reference_doctype: DF.Link
 		skipped_rows: DF.Table[DataImportSkippedRow]
-		status: DF.Literal["Pending", "In Progress", "Success", "Partial Success", "Error", "Timed Out"]
+		status: DF.Literal[
+			"Pending", "In Progress", "Success", "Partial Success", "Error", "Timed Out", "Paused"
+		]
 		submit_after_import: DF.Check
 		template_options: DF.Code | None
 		template_warnings: DF.Code | None
@@ -96,6 +110,9 @@ class DataImport(Document):
 			self.skipped_rows = []
 			# Tree overrides are keyed by sheet row number, so a new file invalidates them.
 			self.tree_parent_overrides = ""
+			# The saved pause reason described the previous file's run.
+			self.pause_reason = ""
+			self.pause_fingerprint = ""
 
 		# Overrides belong to one DocType's tree.
 		if doc_before_save and doc_before_save.reference_doctype != self.reference_doctype:
@@ -103,6 +120,8 @@ class DataImport(Document):
 
 		self.clear_stale_template_warnings(doc_before_save)
 		self.set_delimiters_flag()
+		if cint(self.failure_budget) < 0:
+			frappe.throw(_("Failure Budget cannot be negative."))
 		self.validate_doctype()
 		self.validate_google_sheets_url()
 		importer = self.get_importer() if (self.import_file or self.google_sheets_url) else None
@@ -459,6 +478,9 @@ def get_import_status(data_import_name: str):
 	import_status["processed_records"] = logged_total
 	if logged_total and not import_status.get("total_records"):
 		import_status["total_records"] = logged_total
+
+	if data_import.status == "Paused":
+		import_status["pause_reason"] = data_import.pause_reason
 
 	return import_status
 

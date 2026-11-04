@@ -1373,6 +1373,21 @@ frappe.ui.form.on("Data Import", {
 		return true;
 	},
 
+	// Paused run: persist the raised budget or fixed data first, then resume.
+	async continue_import(frm) {
+		if (frm.is_dirty()) {
+			const saved = await save_wizard_form_if_needed(frm);
+			if (!saved) {
+				frappe.show_alert({
+					message: __("Save your changes before continuing."),
+					indicator: "orange",
+				});
+				return;
+			}
+		}
+		frm.events.begin_import(frm);
+	},
+
 	// Mark started, paint progress, open Import step, enqueue.
 	begin_import(frm) {
 		frm.import_in_progress = true;
@@ -1483,6 +1498,23 @@ frappe.ui.form.on("Data Import", {
 				}
 
 				const is_upsert = is_upsert_import_type(frm.doc.import_type);
+
+				if (r.message.status === "Paused") {
+					let message = `<div class="diw-paused-headline text-ink-amber-6">${frappe.utils.escape_html(
+						r.message.pause_reason ||
+							__("Import paused after reaching the failure budget.")
+					)}</div>`;
+					if (failed_records > 0) {
+						message +=
+							"<br/>" +
+							__(
+								"Fix the failed rows or increase the Failure Budget in the Config step, then Continue Import."
+							);
+					}
+					frm.dashboard.set_headline(message);
+					return;
+				}
+
 				let message = get_import_status_message(
 					frm.doc.import_type,
 					is_upsert ? cint(r.message.inserted) : successful_records,
@@ -2883,6 +2915,11 @@ frappe.ui.form.on("Data Import", {
 
 			const wrapper = frm.get_field("import_log_preview").$wrapper;
 			wrapper.html(`
+				${
+					status_summary.status === "Paused"
+						? `<div class="diw-pause-banner-slot mb-4"></div>`
+						: ""
+				}
 				${summary_html}
 				<div class="diw-import-log-filter-row mt-3 mb-3 flex items-center justify-between gap-2">
 					<div class="diw-import-log-filter-tabs"></div>
@@ -2905,6 +2942,17 @@ frappe.ui.form.on("Data Import", {
 						: `<div class="diw-import-log-empty-state">${empty_state_html}</div>`
 				}
 			`);
+
+			if (status_summary.status === "Paused") {
+				wrapper.find(".diw-pause-banner-slot").append(
+					frappe.ui.alert({
+						title:
+							status_summary.pause_reason ||
+							__("Import paused after reaching the failure budget."),
+						theme: "amber",
+					})
+				);
+			}
 
 			const log_filter = new frappe.ui.TabButtons({
 				label: __("Filter import log"),
@@ -2980,6 +3028,8 @@ frappe.ui.form.on("Data Import", {
 					failed: cint(m.failed),
 					inserted: cint(m.inserted),
 					updated: cint(m.updated),
+					status: m.status,
+					pause_reason: m.pause_reason,
 				};
 				fetch_logs(frm._import_log_status_summary);
 			},

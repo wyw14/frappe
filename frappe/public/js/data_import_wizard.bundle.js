@@ -15,6 +15,7 @@ const REPARENTED_FIELDS = [
 	"import_type",
 	"mute_emails",
 	"submit_after_import",
+	"failure_budget",
 	"use_csv_sniffer",
 	"custom_delimiters",
 	"delimiter_options",
@@ -460,6 +461,7 @@ frappe.ui.DataImportWizard = class DataImportWizard {
 		[
 			"mute_emails",
 			"submit_after_import",
+			"failure_budget",
 			"custom_delimiters",
 			"delimiter_options",
 			"use_csv_sniffer",
@@ -1158,13 +1160,16 @@ frappe.ui.DataImportWizard = class DataImportWizard {
 						onclick: () => frm.events.cancel_import(frm),
 					})
 				);
-			} else if (["Error", "Partial Success", "Timed Out"].includes(status)) {
+			} else if (["Error", "Partial Success", "Timed Out", "Paused"].includes(status)) {
 				this.$footer_right.append(
 					frappe.ui.button({
-						label: __("Retry"),
+						label: status === "Paused" ? __("Continue Import") : __("Retry"),
 						variant: "solid",
-						icon_left: "refresh-cw",
-						onclick: () => frm.events.begin_import(frm),
+						icon_left: status === "Paused" ? "play" : "refresh-cw",
+						onclick: () =>
+							status === "Paused"
+								? frm.events.continue_import(frm)
+								: frm.events.begin_import(frm),
 					})
 				);
 			}

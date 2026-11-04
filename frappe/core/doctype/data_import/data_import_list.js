@@ -20,6 +20,7 @@ frappe.listview_settings["Data Import"] = {
 			"In Progress": "amber",
 			Error: "red",
 			"Timed Out": "amber",
+			Paused: "amber",
 		};
 		let status = doc.status;
 
